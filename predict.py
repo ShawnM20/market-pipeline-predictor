@@ -1,11 +1,14 @@
+import os
 import sqlite3
-import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
 from datetime import datetime
 
-DB_PATH = 'market_data.db'
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'market_data.db')
+EXPORT_PATH = os.path.join(BASE_DIR, 'combined_prices.csv')
 
 
 def load_data():
@@ -16,93 +19,98 @@ def load_data():
 
 
 def build_features(df):
+    # Every feature only uses information available BEFORE the hour being predicted.
     df = df.copy()
-    df['lag_close'] = df.groupby('asset')['close'].shift(1)
-    df['lag_close_2'] = df.groupby('asset')['close'].shift(2)
-    df['momentum'] = df['close'] - df.groupby('asset')['close'].shift(3)
-    df['ma_volume'] = (
-        df.groupby('asset')['volume']
-        .transform(lambda x: x.rolling(5, min_periods=1).mean())
-    )
-    df = df.dropna()
-    return df
+    g = df.groupby('asset')
+    df['lag_close'] = g['close'].shift(1)
+    df['lag_close_2'] = g['close'].shift(2)
+    df['momentum'] = df['lag_close'] - g['close'].shift(4)  # change over the previous 3 hours
+    df['ma_volume'] = g['volume'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+    return df.dropna()
 
 
-def train_and_predict(df):
-    results = []
+def train_and_evaluate(df):
+    features = ['lag_close', 'lag_close_2', 'momentum', 'ma_volume']
+    predictions, summary = [], []
 
     for asset in df['asset'].unique():
-        asset_df = df[df['asset'] == asset].copy()
-
-        if len(asset_df) < 10:
-            print(f"  {asset}: not enough rows, skipping")
+        a = df[df['asset'] == asset]
+        if len(a) < 20:
+            print(f"  {asset}: not enough rows ({len(a)}), skipping")
             continue
 
-        X = asset_df[['lag_close', 'lag_close_2', 'momentum', 'ma_volume']]
-        y = asset_df['close']
+        # Time-based split: train on the first 80%, test on the most recent 20%
+        split = int(len(a) * 0.8)
+        train, test = a.iloc[:split], a.iloc[split:]
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = LinearRegression().fit(train[features], train['close'])
+        test_preds = model.predict(test[features])
 
-        model = LinearRegression()
-        model.fit(X_train, y_train)
+        # Baseline: predict that the price stays the same as last hour
+        naive_preds = test['lag_close']
 
-        test_preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, test_preds)
-        pct_err = (mae / y_test.mean()) * 100
+        model_err = mean_absolute_error(test['close'], test_preds) / test['close'].mean() * 100
+        naive_err = mean_absolute_error(test['close'], naive_preds) / test['close'].mean() * 100
+        beats = model_err < naive_err
 
-        print(f"  {asset}: MAE={mae:.4f}  Error={pct_err:.2f}%  (rows={len(asset_df)})")
+        print(f"  {asset}: model error {model_err:.3f}% vs. baseline {naive_err:.3f}% "
+              f"({'beats' if beats else 'does not beat'} baseline, {len(test)} test hours)")
 
-        all_preds = model.predict(X)
-        for i, (idx, actual) in enumerate(zip(X.index, y)):
-            results.append({
-                'timestamp': asset_df.loc[idx, 'timestamp'],
+        summary.append({
+            'asset': asset,
+            'train_hours': len(train),
+            'test_hours': len(test),
+            'model_error_pct': round(model_err, 4),
+            'baseline_error_pct': round(naive_err, 4),
+            'beats_baseline': int(beats),
+        })
+        for ts, actual, pred, naive in zip(test['timestamp'], test['close'], test_preds, naive_preds):
+            predictions.append({
+                'timestamp': ts,
                 'asset': asset,
-                'actual_price': round(float(actual), 6),
-                'predicted_price': round(float(all_preds[i]), 6),
-                'mae': round(float(mae), 6),
-                'run_at': str(datetime.now()),
+                'actual_price': round(float(actual), 4),
+                'predicted_price': round(float(pred), 4),
+                'baseline_price': round(float(naive), 4),
             })
 
-    return results
+    return pd.DataFrame(predictions), pd.DataFrame(summary)
 
 
-def save_predictions(results):
+def save_results(prices, predictions, summary):
+    run_at = str(datetime.now())
+    predictions['run_at'] = run_at
+    summary['run_at'] = run_at
+
     conn = sqlite3.connect(DB_PATH)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS predicted_prices (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp       TEXT,
-            asset           TEXT,
-            actual_price    REAL,
-            predicted_price REAL,
-            mae             REAL,
-            run_at          TEXT
-        )
-    ''')
-    conn.execute('DELETE FROM predicted_prices')  # clear stale predictions before each run
-    conn.executemany(
-        '''INSERT INTO predicted_prices
-           (timestamp, asset, actual_price, predicted_price, mae, run_at)
-           VALUES (:timestamp, :asset, :actual_price, :predicted_price, :mae, :run_at)''',
-        results
-    )
-    conn.commit()
+    predictions.to_sql('predicted_prices', conn, if_exists='replace', index=False)
+    summary.to_sql('model_results', conn, if_exists='replace', index=False)
     conn.close()
-    print(f"  {len(results)} predictions saved to predicted_prices table")
+
+    # This CSV feeds the Tableau dashboard: every hour's actual price, with the
+    # model and baseline predictions filled in for the test period only.
+    combined = prices[['timestamp', 'asset', 'close']].rename(columns={'close': 'actual_price'})
+    combined = combined.merge(
+        predictions[['timestamp', 'asset', 'predicted_price', 'baseline_price']],
+        on=['timestamp', 'asset'], how='left'
+    )
+    combined.to_csv(EXPORT_PATH, index=False)
+
+    print(f"  {len(predictions)} test-period predictions saved")
+    print(f"  Model beat the baseline on {int(summary['beats_baseline'].sum())} of {len(summary)} assets")
 
 
 if __name__ == '__main__':
     print("Loading data...")
-    df = load_data()
-    print(f"  {len(df)} rows loaded")
+    prices = load_data()
+    print(f"  {len(prices)} rows loaded")
 
     print("Building features...")
-    df = build_features(df)
+    df = build_features(prices)
 
-    print("Training models...")
-    results = train_and_predict(df)
+    print("Training and evaluating models...")
+    predictions, summary = train_and_evaluate(df)
 
-    print("Saving predictions...")
-    save_predictions(results)
+    print("Saving results...")
+    save_results(prices, predictions, summary)
 
     print("Done.")
