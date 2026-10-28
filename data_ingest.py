@@ -1,13 +1,16 @@
-import yfinance as yf
+import os
 import sqlite3
 from datetime import datetime
 
-DB_PATH = 'market_data.db'
+import yfinance as yf
+
+# Use the script's own folder so it works when Task Scheduler runs it
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'market_data.db')
 ASSETS = ['BTC-USD', 'ETH-USD', 'NVDA', 'MSFT']
 
 
-def fetch_and_store():
-    conn = sqlite3.connect(DB_PATH)
+def setup_db(conn):
     conn.execute('''
         CREATE TABLE IF NOT EXISTS prices (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,8 +23,16 @@ def fetch_and_store():
             volume    REAL
         )
     ''')
+    # Each run pulls the last 5 days, so the same hour shows up many times.
+    # This index makes sure each asset/hour is only stored once.
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_prices_ts_asset ON prices (timestamp, asset)')
 
-    fetched = 0
+
+def fetch_and_store():
+    conn = sqlite3.connect(DB_PATH)
+    setup_db(conn)
+
+    added = 0
     for asset in ASSETS:
         data = yf.download(asset, period='5d', interval='1h', auto_adjust=True, progress=False)
         if data.columns.nlevels > 1:
@@ -30,28 +41,25 @@ def fetch_and_store():
             print(f"  No data for {asset}")
             continue
 
-        rows = []
-        for ts, row in data.iterrows():
-            rows.append((
-                str(ts),
-                asset,
-                float(row['Open']),
-                float(row['High']),
-                float(row['Low']),
-                float(row['Close']),
-                float(row['Volume']),
-            ))
+        rows = [
+            (str(ts), asset, float(r['Open']), float(r['High']), float(r['Low']),
+             float(r['Close']), float(r['Volume']))
+            for ts, r in data.iterrows()
+        ]
 
+        before = conn.total_changes
         conn.executemany(
-            'INSERT INTO prices (timestamp, asset, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)',
+            'INSERT OR IGNORE INTO prices (timestamp, asset, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)',
             rows
         )
-        fetched += len(rows)
-        print(f"  {asset}: {len(rows)} rows inserted")
+        new_rows = conn.total_changes - before
+        added += new_rows
+        print(f"  {asset}: {new_rows} new rows ({len(rows) - new_rows} already stored)")
 
     conn.commit()
+    total = conn.execute('SELECT COUNT(*) FROM prices').fetchone()[0]
     conn.close()
-    print(f"Done at {datetime.now()} — {fetched} total rows added")
+    print(f"Done at {datetime.now()}: {added} new rows, {total} rows total")
 
 
 if __name__ == '__main__':
